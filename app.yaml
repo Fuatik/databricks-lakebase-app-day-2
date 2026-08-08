@@ -13,3 +13,9 @@ env:
     value: "massive"
   - name: MASSIVE_SECRET_KEY
     value: "api-key"
+  - name: NWS_API_BASE_URL
+    value: "https://api.weather.gov"
+  - name: NWS_USER_AGENT
+    value: "weather-rag-app/1.0 (fuatsafiulin@gmail.com)"
+  - name: GEOCODER_BASE_URL
+    value: "https://nominatim.openstreetmap.org"

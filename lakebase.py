@@ -58,3 +58,75 @@ def run_write(sql: str, params: tuple | dict | None = None) -> int:
             cur.execute(sql, params)
             conn.commit()
             return cur.rowcount
+
+
+def ensure_weather_documents_table() -> None:
+    """Create the table for raw NWS alert and forecast documents."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS weather_documents (
+                    id TEXT PRIMARY KEY,
+                    location TEXT NOT NULL,
+                    source_type TEXT NOT NULL
+                        CHECK (source_type IN ('alert', 'forecast')),
+                    headline TEXT NOT NULL,
+                    narrative_text TEXT NOT NULL,
+                    issued_at TIMESTAMPTZ,
+                    effective_at TIMESTAMPTZ,
+                    payload JSONB NOT NULL,
+                    synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_weather_documents_location_source_type
+                ON weather_documents (location, source_type)
+                """
+            )
+
+        conn.commit()
+
+
+def ensure_weather_embeddings_table() -> None:
+    """Create the pgvector table used for weather chunk embeddings."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS weather_embeddings (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL
+                        REFERENCES weather_documents(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    embedding VECTOR(384) NOT NULL,
+                    model_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (document_id, chunk_index, model_name)
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_weather_embeddings_hnsw
+                ON weather_embeddings
+                USING hnsw (embedding vector_cosine_ops)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_weather_embeddings_document_id
+                ON weather_embeddings (document_id)
+                """
+            )
+
+        conn.commit()

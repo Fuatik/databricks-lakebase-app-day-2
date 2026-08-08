@@ -20,6 +20,11 @@ from flask import Flask, jsonify, render_template, request
 import lakebase
 from massive_client import MassiveClient
 
+import json
+from weather_client import WeatherClient
+
+from sentence_transformers import SentenceTransformer
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
 
@@ -29,6 +34,22 @@ _w = WorkspaceClient()
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
+WEATHER_DOCUMENTS_TABLE_NAME = os.environ.get(
+    "WEATHER_DOCUMENTS_TABLE_NAME",
+    "weather_documents",
+)
+WEATHER_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+logger.info(
+    "Loading weather embedding model: %s",
+    WEATHER_EMBEDDING_MODEL_NAME,
+)
+try:
+    weather_embedding_model = SentenceTransformer(WEATHER_EMBEDDING_MODEL_NAME)
+    logger.info("✅ Weather embedding model loaded")
+except Exception as e:
+    logger.error(f"Failed to load embedding model: {e}")
+    raise
 
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
@@ -404,6 +425,254 @@ def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
                 count += 1
             conn.commit()
     return count
+
+
+def _upsert_weather_documents(documents: list[dict]) -> int:
+    """
+    Insert/update normalized NWS documents.
+
+    Uses the stable document `id` as the deduplication key, so running
+    /weather/sync again refreshes a document instead of creating a duplicate.
+    """
+    if not documents:
+        return 0
+
+    count = 0
+
+    # Same Lakebase pattern as lakebase.py:
+    # lakebase.get_connection() -> psycopg2 -> RealDictCursor.
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for document in documents:
+                cur.execute(
+                    f"""
+                    INSERT INTO {WEATHER_DOCUMENTS_TABLE_NAME} (
+                        id,
+                        location,
+                        source_type,
+                        headline,
+                        narrative_text,
+                        issued_at,
+                        effective_at,
+                        payload,
+                        synced_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now()
+                    )
+                    ON CONFLICT (id) DO UPDATE
+                    SET
+                        location = EXCLUDED.location,
+                        source_type = EXCLUDED.source_type,
+                        headline = EXCLUDED.headline,
+                        narrative_text = EXCLUDED.narrative_text,
+                        issued_at = EXCLUDED.issued_at,
+                        effective_at = EXCLUDED.effective_at,
+                        payload = EXCLUDED.payload,
+                        synced_at = now()
+                    """,
+                    (
+                        document["id"],
+                        document["location"],
+                        document["source_type"],
+                        document["headline"],
+                        document["narrative_text"],
+                        document.get("issued_at"),
+                        document.get("effective_at"),
+                        json.dumps(document["payload"]),
+                    ),
+                )
+                count += 1
+
+            conn.commit()
+
+    return count
+
+
+@app.route("/weather/sync", methods=["POST"])
+def sync_weather():
+    """
+    Fetch alerts and forecasts from NWS and write them to Lakebase.
+
+    Example request body:
+    {
+      "locations": ["Chicago, IL", "Austin, TX"],
+      "limit": 50
+    }
+
+    `limit` is the total maximum number of documents returned across all
+    supplied locations.
+    """
+    lakebase.ensure_weather_documents_table()
+    lakebase.ensure_weather_embeddings_table()
+    
+    body = request.get_json(silent=True) or {}
+
+    locations = body.get("locations")
+    if not isinstance(locations, list) or not locations:
+        return jsonify({
+            "error": "'locations' must be a non-empty list of city/state names or lat,lon pairs"
+        }), 400
+
+    locations = [
+        location.strip()
+        for location in locations
+        if isinstance(location, str) and location.strip()
+    ]
+    if not locations:
+        return jsonify({"error": "No valid locations supplied"}), 400
+
+    try:
+        limit = int(body.get("limit", 50))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'limit' must be an integer"}), 400
+
+    limit = max(1, min(limit, 200))
+
+    client = WeatherClient()
+
+    documents: list[dict] = []
+    errors: list[dict] = []
+
+    for location in locations:
+        remaining = limit - len(documents)
+        if remaining <= 0:
+            break
+
+        try:
+            location_documents = client.fetch_documents_for_location(
+                location,
+                limit=remaining,
+            )
+            documents.extend(location_documents)
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("Weather sync failed for %s: %s", location, exc)
+            errors.append({
+                "location": location,
+                "error": str(exc),
+            })
+
+    synced = _upsert_weather_documents(documents)
+
+    return jsonify({
+        "synced": synced,
+        "documents_fetched": len(documents),
+        "locations": locations,
+        "errors": errors,
+    })
+
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """
+    Semantic cosine-similarity search over weather_embeddings.
+
+    Example:
+    POST /weather/search
+    {
+      "query": "risk of flooding near rivers",
+      "top_k": 5,
+      "source_type": "alert"
+    }
+
+    `source_type` is optional: "alert" or "forecast".
+    """
+    body = request.get_json(silent=True)
+
+    if not isinstance(body, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"error": "'query' must be a non-empty string"}), 400
+
+    query = query.strip()
+
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'top_k' must be an integer"}), 400
+
+    # Required bound: always return from 1 to 20 matches.
+    top_k = max(1, min(top_k, 20))
+
+    # Optional stretch-goal filter.
+    source_type = body.get("source_type")
+    if source_type not in (None, "alert", "forecast"):
+        return jsonify({
+            "error": "'source_type' must be 'alert' or 'forecast'"
+        }), 400
+
+    # Same model as the ingestion notebook.
+    query_embedding = weather_embedding_model.encode(
+        query,
+        normalize_embeddings=True,
+    ).tolist()
+
+    # pgvector expects text such as: [0.12,-0.44,...]
+    query_vector = "[" + ",".join(
+        str(float(value))
+        for value in query_embedding
+    ) + "]"
+
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    d.id,
+                    d.location,
+                    d.source_type,
+                    d.headline,
+                    d.narrative_text,
+                    e.chunk_text,
+                    1 - (e.embedding <=> %s::vector) AS similarity
+                FROM weather_embeddings e
+                JOIN weather_documents d
+                    ON d.id = e.document_id
+                WHERE (%s IS NULL OR d.source_type = %s)
+                ORDER BY e.embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (
+                    query_vector,
+                    source_type,
+                    source_type,
+                    query_vector,
+                    top_k,
+                ),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return jsonify({
+            "query": query,
+            "results": [],
+            "message": (
+                "No matching weather embeddings found. "
+                "Run /weather/sync and the embedding notebook first."
+            ),
+        })
+
+    results = [
+        {
+            "id": row["id"],
+            "location": row["location"],
+            "source_type": row["source_type"],
+            "headline": row["headline"],
+            "narrative_text": row["narrative_text"],
+            "chunk_text": row["chunk_text"],
+            "similarity": float(row["similarity"]),
+        }
+        for row in rows
+    ]
+
+    return jsonify({
+        "query": query,
+        "top_k": top_k,
+        "source_type": source_type,
+        "results": results,
+    })
 
 
 if __name__ == '__main__':

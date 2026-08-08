@@ -59,16 +59,22 @@
     }
     label:first-child { margin-top: 0; }
 
-    input[type="text"] {
+    input[type="text"],
+    input[type="number"],
+    textarea {
       width: 100%;
       padding: 10px 12px;
       margin-top: 6px;
       border: 1px solid var(--border);
       border-radius: 8px;
       font-size: 14px;
+      font-family: inherit;
       transition: border-color 0.15s ease;
     }
-    input[type="text"]:focus {
+
+    input[type="text"]:focus,
+    input[type="number"]:focus,
+    textarea:focus {
       outline: none;
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
@@ -100,6 +106,21 @@
       color: var(--muted);
     }
     #result:empty { display: none; }
+
+    #weather-result {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      background: #f6f6f6;
+      padding: 12px 14px;
+      border-radius: 8px;
+      min-height: 20px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    #weather-result:empty {
+      display: none;
+    }
 
     table {
       width: 100%;
@@ -169,6 +190,31 @@
       <tbody id="watchlist-body"></tbody>
     </table>
   </div>
+  <div class="card">
+    
+  <h2>Weather sync</h2>
+  <p class="hint">
+    Enter one location per line. Use a city/state or coordinates:
+    <code>Chicago, IL</code> or <code>41.8781,-87.6298</code>.
+  </p>
+
+  <form id="weather-form">
+    <label for="weather-locations">Locations</label>
+    <textarea
+      id="weather-locations"
+      rows="4"
+      placeholder="Chicago, IL&#10;Austin, TX"
+      required
+    ></textarea>
+
+    <label for="weather-limit">Maximum documents</label>
+    <input type="number" id="weather-limit" min="1" max="200" value="50">
+
+    <button type="submit">Sync weather data</button>
+  </form>
+
+  <div id="weather-result"></div>
+</div>
 
   <script>
     const form = document.getElementById("stock-form");
@@ -262,7 +308,58 @@
         btn.disabled = false;
       }
     });
+    const weatherForm = document.getElementById("weather-form");
+    const weatherResultEl = document.getElementById("weather-result");
 
+    weatherForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      // One location per line, so commas inside "Chicago, IL" are preserved.
+      const locations = document.getElementById("weather-locations").value
+        .split("\n")
+        .map((location) => location.trim())
+        .filter(Boolean);
+
+      const limit = Number(document.getElementById("weather-limit").value) || 50;
+
+      if (!locations.length) {
+        weatherResultEl.textContent = "Enter at least one location.";
+        return;
+      }
+
+      weatherResultEl.textContent = "Fetching alerts and forecasts from NWS...";
+
+      try {
+        const resp = await fetch("/weather/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ locations, limit }),
+        });
+
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          weatherResultEl.textContent =
+            "Error: " + (data.error || resp.statusText);
+          return;
+        }
+
+        let message =
+          `Synced ${data.synced} weather documents ` +
+          `(${data.documents_fetched} fetched).`;
+
+        if (data.errors && data.errors.length) {
+          message += "\nSome locations failed:\n" +
+            data.errors
+              .map((item) => `• ${item.location}: ${item.error}`)
+              .join("\n");
+        }
+
+        weatherResultEl.textContent = message;
+      } catch (err) {
+        weatherResultEl.textContent = "Request failed: " + err;
+      }
+    });
     loadWatchlist();
   </script>
 </body>
